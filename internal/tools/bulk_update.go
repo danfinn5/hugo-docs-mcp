@@ -39,6 +39,15 @@ func BulkUpdateFrontmatterTool() mcp.Tool {
 		mcp.WithBoolean("dry_run",
 			mcp.Description("Preview changes without writing files (default: true)"),
 		),
+		mcp.WithBoolean("only_if_missing",
+			mcp.Description("Only update pages where the field does not exist at all (default: false)"),
+		),
+		mcp.WithBoolean("only_if_empty",
+			mcp.Description("Only update pages where the field is missing or has an empty value (default: false)"),
+		),
+		mcp.WithBoolean("only_drafts",
+			mcp.Description("Only update draft pages (default: false)"),
+		),
 	)
 }
 
@@ -78,6 +87,9 @@ func HandleBulkUpdateFrontmatter(ctx context.Context, req mcp.CallToolRequest) (
 
 	section := req.GetString("section", "")
 	dryRun := req.GetBool("dry_run", true)
+	onlyIfMissing := req.GetBool("only_if_missing", false)
+	onlyIfEmpty := req.GetBool("only_if_empty", false)
+	onlyDrafts := req.GetBool("only_drafts", false)
 
 	pages, err := hugo.ScanContentDir(contentDir)
 	if err != nil {
@@ -94,11 +106,29 @@ func HandleBulkUpdateFrontmatter(ctx context.Context, req mcp.CallToolRequest) (
 			continue
 		}
 
+		// Filter by draft status
+		if onlyDrafts && !p.FrontMatter.Draft {
+			skipped++
+			continue
+		}
+
 		oldVal := ""
+		fieldExists := false
 		if p.FrontMatter.Raw != nil {
 			if v, ok := p.FrontMatter.Raw[field]; ok {
+				fieldExists = true
 				oldVal = fmt.Sprintf("%v", v)
 			}
+		}
+
+		// Conditional filters
+		if onlyIfMissing && fieldExists {
+			skipped++
+			continue
+		}
+		if onlyIfEmpty && fieldExists && strings.TrimSpace(oldVal) != "" {
+			skipped++
+			continue
 		}
 
 		entries = append(entries, updateEntry{

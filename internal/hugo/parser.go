@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,8 +32,8 @@ type Page struct {
 	FrontMatter FrontMatter
 }
 
-// ParseFrontMatter reads a markdown file and extracts YAML front matter.
-// Returns the parsed front matter and the raw map of all fields.
+// ParseFrontMatter reads a markdown file and extracts front matter.
+// Supports both YAML (--- delimited) and TOML (+++ delimited) formats.
 func ParseFrontMatter(path string) (FrontMatter, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -44,6 +45,7 @@ func ParseFrontMatter(path string) (FrontMatter, error) {
 	var lines []string
 	inFrontMatter := false
 	found := false
+	delimiter := ""
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -52,6 +54,12 @@ func ParseFrontMatter(path string) (FrontMatter, error) {
 		if !inFrontMatter {
 			if trimmed == "---" {
 				inFrontMatter = true
+				delimiter = "---"
+				continue
+			}
+			if trimmed == "+++" {
+				inFrontMatter = true
+				delimiter = "+++"
 				continue
 			}
 			// Skip BOM or empty lines before front matter
@@ -62,7 +70,7 @@ func ParseFrontMatter(path string) (FrontMatter, error) {
 			break
 		}
 
-		if trimmed == "---" {
+		if trimmed == delimiter {
 			found = true
 			break
 		}
@@ -74,22 +82,61 @@ func ParseFrontMatter(path string) (FrontMatter, error) {
 	}
 
 	if !found {
-		return FrontMatter{}, fmt.Errorf("no YAML front matter found in %s", path)
+		return FrontMatter{}, fmt.Errorf("no front matter found in %s", path)
 	}
 
-	yamlContent := strings.Join(lines, "\n")
+	fmContent := strings.Join(lines, "\n")
 
+	if delimiter == "+++" {
+		return parseTOMLFrontMatter(fmContent, path)
+	}
+	return parseYAMLFrontMatter(fmContent, path)
+}
+
+func parseYAMLFrontMatter(content, path string) (FrontMatter, error) {
 	var fm FrontMatter
-	if err := yaml.Unmarshal([]byte(yamlContent), &fm); err != nil {
+	if err := yaml.Unmarshal([]byte(content), &fm); err != nil {
 		return FrontMatter{}, fmt.Errorf("parse front matter in %s: %w", path, err)
 	}
 
-	// Also parse into raw map for flexible field checking
 	var raw map[string]any
-	if err := yaml.Unmarshal([]byte(yamlContent), &raw); err != nil {
+	if err := yaml.Unmarshal([]byte(content), &raw); err != nil {
 		return FrontMatter{}, fmt.Errorf("parse raw front matter in %s: %w", path, err)
 	}
 	fm.Raw = raw
+
+	return fm, nil
+}
+
+func parseTOMLFrontMatter(content, path string) (FrontMatter, error) {
+	var raw map[string]any
+	if _, err := toml.Decode(content, &raw); err != nil {
+		return FrontMatter{}, fmt.Errorf("parse TOML front matter in %s: %w", path, err)
+	}
+
+	fm := FrontMatter{Raw: raw}
+
+	// Extract known fields from the raw map
+	if v, ok := raw["title"].(string); ok {
+		fm.Title = v
+	}
+	if v, ok := raw["description"].(string); ok {
+		fm.Description = v
+	}
+	if v, ok := raw["draft"].(bool); ok {
+		fm.Draft = v
+	}
+	if v, ok := raw["weight"].(int64); ok {
+		fm.Weight = int(v)
+	}
+
+	// Handle date fields — TOML parses dates as time.Time
+	if v, ok := raw["date"].(time.Time); ok {
+		fm.Date = v
+	}
+	if v, ok := raw["lastmod"].(time.Time); ok {
+		fm.LastMod = v
+	}
 
 	return fm, nil
 }
@@ -207,6 +254,80 @@ func inferDefaultValue(key string) any {
 	default:
 		return ""
 	}
+}
+
+// ParsePageFull reads a markdown file and returns both front matter and the raw body.
+// Supports both YAML (---) and TOML (+++) front matter delimiters.
+func ParsePageFull(path string) (FrontMatter, string, error) {
+	rawBytes, err := os.ReadFile(path)
+	if err != nil {
+		return FrontMatter{}, "", fmt.Errorf("open %s: %w", path, err)
+	}
+
+	content := string(rawBytes)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	var fmLines []string
+	inFM := false
+	found := false
+	delimiter := ""
+	pos := 0
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		lineLen := len(line) + 1
+		trimmed := strings.TrimSpace(line)
+
+		if !inFM {
+			if trimmed == "---" {
+				inFM = true
+				delimiter = "---"
+				pos += lineLen
+				continue
+			}
+			if trimmed == "+++" {
+				inFM = true
+				delimiter = "+++"
+				pos += lineLen
+				continue
+			}
+			if trimmed == "" || trimmed == "\xef\xbb\xbf" {
+				pos += lineLen
+				continue
+			}
+			return FrontMatter{}, content, fmt.Errorf("no front matter found in %s", path)
+		}
+
+		if trimmed == delimiter {
+			found = true
+			pos += lineLen
+			break
+		}
+		fmLines = append(fmLines, line)
+		pos += lineLen
+	}
+
+	if !found {
+		return FrontMatter{}, content, fmt.Errorf("no front matter found in %s", path)
+	}
+
+	fmContent := strings.Join(fmLines, "\n")
+
+	var fm FrontMatter
+	if delimiter == "+++" {
+		fm, err = parseTOMLFrontMatter(fmContent, path)
+	} else {
+		fm, err = parseYAMLFrontMatter(fmContent, path)
+	}
+	if err != nil {
+		return FrontMatter{}, content, err
+	}
+
+	body := ""
+	if pos <= len(content) {
+		body = content[pos:]
+	}
+
+	return fm, body, nil
 }
 
 func relPath(base, target string) string {

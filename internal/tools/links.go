@@ -46,10 +46,13 @@ type linksResult struct {
 
 // Patterns for internal links:
 //   - [text](/path/to/page/) or [text](/path/to/page)
+//   - [text](/path/to/page/#anchor) or [text](#anchor) (same-page)
 //   - {{< ref "path" >}} or {{< relref "path" >}}
 var (
-	mdLinkRe  = regexp.MustCompile(`\[([^\]]*)\]\((/[^)#?]+)\)`)
-	refRe     = regexp.MustCompile(`\{\{<\s*(?:rel)?ref\s+"([^"]+)"\s*>\}\}`)
+	mdLinkRe       = regexp.MustCompile(`\[([^\]]*)\]\((/[^)\s]+)\)`)
+	samepageLinkRe = regexp.MustCompile(`\[([^\]]*)\]\((#[^)\s]+)\)`)
+	refRe          = regexp.MustCompile(`\{\{<\s*(?:rel)?ref\s+"([^"]+)"\s*>\}\}`)
+	headingAnchorRe = regexp.MustCompile(`^#{1,6}\s+(.+)`)
 )
 
 // HandleCheckLinks implements the check_links tool.
@@ -67,6 +70,26 @@ func HandleCheckLinks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	// Build an index of known content paths for resolution.
 	knownPaths := buildPathIndex(contentDir, pages)
 
+	// Build heading anchor index: page path → set of anchor IDs
+	anchorIndex := buildAnchorIndex(contentDir, pages)
+
+	// Build page path → abs path mapping for anchor resolution
+	pageAbsPaths := make(map[string]string)
+	for _, p := range pages {
+		rel := p.RelPath
+		ext := filepath.Ext(rel)
+		noExt := strings.TrimSuffix(rel, ext)
+		pageAbsPaths["/"+rel] = p.AbsPath
+		pageAbsPaths["/"+noExt] = p.AbsPath
+		pageAbsPaths["/"+noExt+"/"] = p.AbsPath
+		base := filepath.Base(noExt)
+		if base == "_index" {
+			sectionPath := "/" + filepath.Dir(rel)
+			pageAbsPaths[sectionPath] = p.AbsPath
+			pageAbsPaths[sectionPath+"/"] = p.AbsPath
+		}
+	}
+
 	var broken []brokenLink
 	totalLinks := 0
 
@@ -74,13 +97,47 @@ func HandleCheckLinks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 		links := extractLinks(p.AbsPath)
 		for _, link := range links {
 			totalLinks++
-			if !resolveLink(contentDir, knownPaths, link.target) {
+
+			target := link.target
+			pagePart, fragment := splitFragment(target)
+
+			if pagePart == "" {
+				// Same-page anchor link (#something)
+				if fragment != "" {
+					pageAnchors := getPageAnchors(anchorIndex, p.AbsPath)
+					if !pageAnchors[fragment] {
+						broken = append(broken, brokenLink{
+							SourcePath: p.RelPath,
+							Line:       link.line,
+							Target:     target,
+							Reason:     "anchor not found in current page",
+						})
+					}
+				}
+				continue
+			}
+
+			if !resolveLink(contentDir, knownPaths, pagePart) {
 				broken = append(broken, brokenLink{
 					SourcePath: p.RelPath,
 					Line:       link.line,
-					Target:     link.target,
+					Target:     target,
 					Reason:     "target page not found",
 				})
+			} else if fragment != "" {
+				// Page exists, check the anchor
+				targetAbsPath := resolveToAbsPath(pageAbsPaths, pagePart)
+				if targetAbsPath != "" {
+					targetAnchors := getPageAnchors(anchorIndex, targetAbsPath)
+					if !targetAnchors[fragment] {
+						broken = append(broken, brokenLink{
+							SourcePath: p.RelPath,
+							Line:       link.line,
+							Target:     target,
+							Reason:     "anchor not found in target page",
+						})
+					}
+				}
 			}
 		}
 	}
@@ -122,6 +179,11 @@ func extractLinks(filePath string) []rawLink {
 			links = append(links, rawLink{line: lineNum, target: match[2]})
 		}
 
+		// Same-page anchor links (#anchor)
+		for _, match := range samepageLinkRe.FindAllStringSubmatch(line, -1) {
+			links = append(links, rawLink{line: lineNum, target: match[2]})
+		}
+
 		// Hugo ref/relref shortcodes
 		for _, match := range refRe.FindAllStringSubmatch(line, -1) {
 			links = append(links, rawLink{line: lineNum, target: match[1]})
@@ -155,6 +217,113 @@ func buildPathIndex(contentDir string, pages []hugo.Page) map[string]bool {
 		}
 	}
 	return idx
+}
+
+// splitFragment separates a link into page path and fragment parts.
+// "/docs/page/#section" → "/docs/page/", "section"
+// "#section" → "", "section"
+func splitFragment(target string) (string, string) {
+	idx := strings.Index(target, "#")
+	if idx < 0 {
+		return target, ""
+	}
+	return target[:idx], target[idx+1:]
+}
+
+// buildAnchorIndex extracts heading anchors from all pages.
+// Returns map of abs path → set of anchor IDs.
+func buildAnchorIndex(contentDir string, pages []hugo.Page) map[string]map[string]bool {
+	index := make(map[string]map[string]bool)
+	for _, p := range pages {
+		anchors := extractHeadingAnchors(p.AbsPath)
+		if len(anchors) > 0 {
+			index[p.AbsPath] = anchors
+		}
+	}
+	return index
+}
+
+// extractHeadingAnchors reads a markdown file and returns the set of heading anchors.
+// Hugo generates anchor IDs by lowercasing, replacing spaces with hyphens, and
+// stripping non-alphanumeric characters.
+func extractHeadingAnchors(filePath string) map[string]bool {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	anchors := make(map[string]bool)
+	scanner := bufio.NewScanner(f)
+	inFrontMatter := false
+	pastFrontMatter := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+
+		if !pastFrontMatter {
+			if trimmed == "---" {
+				if inFrontMatter {
+					pastFrontMatter = true
+				} else {
+					inFrontMatter = true
+				}
+				continue
+			}
+			if inFrontMatter {
+				continue
+			}
+			pastFrontMatter = true
+		}
+
+		if m := headingAnchorRe.FindStringSubmatch(line); m != nil {
+			anchor := headingToAnchor(m[1])
+			if anchor != "" {
+				anchors[anchor] = true
+			}
+		}
+	}
+
+	return anchors
+}
+
+// headingToAnchor converts a heading text to a Hugo-style anchor ID.
+func headingToAnchor(heading string) string {
+	heading = strings.TrimSpace(heading)
+	heading = strings.ToLower(heading)
+
+	var result strings.Builder
+	for _, r := range heading {
+		if r == ' ' || r == '-' {
+			result.WriteRune('-')
+		} else if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			result.WriteRune(r)
+		}
+		// Skip other characters
+	}
+
+	return result.String()
+}
+
+func getPageAnchors(index map[string]map[string]bool, absPath string) map[string]bool {
+	if anchors, ok := index[absPath]; ok {
+		return anchors
+	}
+	return make(map[string]bool)
+}
+
+func resolveToAbsPath(pathMap map[string]string, target string) string {
+	if p, ok := pathMap[target]; ok {
+		return p
+	}
+	if p, ok := pathMap[target+"/"]; ok {
+		return p
+	}
+	if p, ok := pathMap[strings.TrimSuffix(target, "/")]; ok {
+		return p
+	}
+	return ""
 }
 
 // resolveLink checks if a link target can be resolved to a known content page.
